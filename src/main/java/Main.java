@@ -7,22 +7,39 @@ import com.flickr4java.flickr.auth.AuthInterface;
 import com.flickr4java.flickr.auth.Permission;
 import com.flickr4java.flickr.people.PeopleInterface;
 import com.flickr4java.flickr.people.User;
+import com.flickr4java.flickr.photos.Extras;
+import com.flickr4java.flickr.photos.Photo;
+import com.flickr4java.flickr.photos.PhotoList;
 import com.flickr4java.flickr.photosets.Photoset;
 import com.flickr4java.flickr.photosets.Photosets;
 import com.flickr4java.flickr.photosets.PhotosetsInterface;
 import com.flickr4java.flickr.uploader.UploadMetaData;
 import com.flickr4java.flickr.util.AuthStore;
 import com.flickr4java.flickr.util.FileAuthStore;
-import jdk.internal.org.xml.sax.SAXException;
+import org.apache.commons.imaging.formats.jpeg.exif.ExifRewriter;
+import org.apache.commons.imaging.formats.tiff.constants.ExifTagConstants;
+import org.apache.commons.imaging.formats.tiff.constants.TiffTagConstants;
+import org.apache.commons.imaging.formats.tiff.write.TiffOutputDirectory;
+import org.apache.commons.imaging.formats.tiff.write.TiffOutputSet;
+import org.joda.time.Duration;
+import org.joda.time.format.PeriodFormatter;
+import org.joda.time.format.PeriodFormatterBuilder;
 import org.scribe.model.Token;
 import org.scribe.model.Verifier;
+import org.xml.sax.SAXException;
 
-import java.io.File;
-import java.io.IOException;
+import java.io.*;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.text.SimpleDateFormat;
 import java.util.*;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 public class Main {
@@ -36,7 +53,26 @@ public class Main {
     private Flickr flickr;
     private Map<String, List<Path>> albums;
 
+    private ThreadPoolExecutor threadPoolExecutor = new ThreadPoolExecutor(2,
+                Runtime.getRuntime().availableProcessors(),
+                0,
+                TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue(Runtime.getRuntime().availableProcessors(), true),
+                new ThreadPoolExecutor.CallerRunsPolicy());
+
+    PeriodFormatter periodFormatter = new PeriodFormatterBuilder()
+            .appendDays()
+            .appendSuffix("d")
+            .appendHours()
+            .appendSuffix("h")
+            .appendMinutes()
+            .appendSuffix("m")
+            .appendSeconds()
+            .appendSuffix("s")
+            .toFormatter();
+
     private Main() {
+        System.out.println(String.format("Warming up with %d cores", Runtime.getRuntime().availableProcessors()));
         try {
             this.authStore = new FileAuthStore(new File(AUTH_DIR));
         } catch (FlickrException e) {
@@ -45,22 +81,14 @@ public class Main {
         flickr = new Flickr(API_KEY, SHARED_SECRET, new REST());
     }
 
-    public static void main(String... args) throws Exception {
-        if (args.length == 0) {
-            throw new IllegalArgumentException("Inform source path. Eg: java Main C:/temp");
-        }
-
-        Main main = new Main();
-        main.doIt(Paths.get(args[0]));
-    }
-
-    private void doIt(Path source) throws IOException, FlickrException, SAXException {
+    private void upload(Path source) throws IOException, FlickrException, SAXException, InterruptedException {
         System.out.println(String.format("Scanning albums at: %s", source));
         this.albums = findAlbumsToUpload(source);
         System.out.println(String.format("Found %d albums", albums.size()));
 
         if (albums.size() == 0) {
-            System.out.println("We're done here");
+            System.out.println("No albums found to upload.");
+
             return;
         }
 
@@ -78,9 +106,13 @@ public class Main {
                 .flatMap(e -> e.stream())
                 .forEach(e -> {
                     System.out.print(String.format("  Uploading picture %s", e));
-                    pathIdMap.put(e, uploadFile(e));
-                    System.out.println(String.format(" done!"));
+                    threadPoolExecutor.submit(() -> pathIdMap.put(e, uploadFile(e)));
                 });
+        threadPoolExecutor.shutdown();
+        while (!threadPoolExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
+            System.out.println("Awaiting completion of threads.");
+        }
+
         System.out.println(String.format("Uploaded %d pictures", pathIdMap.size()));
 
         System.out.println(String.format("Looking for existing albums"));
@@ -108,8 +140,146 @@ public class Main {
         }
     }
 
+    private Map<String, Photo> getPhotosForSet(String setId) throws FlickrException {
+        Map<String, Photo> result = new HashMap<>();
+        PhotosetsInterface pi = flickr.getPhotosetsInterface();
+        int photosPage = 1;
+        while (true) {
+            PhotoList<Photo> photos = pi.getPhotos(setId, Extras.ALL_EXTRAS, 0, 500, photosPage);
+            try {
+                for (int i = 0; i < photos.size(); i++) {
+                    Photo photo = photos.get(i);
+                    result.put(photo.getId(), photo);
+                }
+            } catch (Exception e) {
+                break;
+            }
+            if (photos.size() < 500) {
+                break;
+            }
+            photosPage++;
+        }
+        return result;
+    }
+
+    private void download(Path target) throws FlickrException, IOException, SAXException, InterruptedException {
+        System.out.println(String.format("Looking for NSID for user %s", USER_NAME));
+        nsid = getNSID(USER_NAME);
+        System.out.println(String.format("Found NSID %s", nsid));
+
+        System.out.println(String.format("Authorizing requests for %s", nsid));
+        authorizeRequests(nsid);
+        System.out.println(String.format("Requests are now authorized"));
+
+        System.out.println(String.format("Looking for albums"));
+        Map<String, Photoset> photosets = getRemoteAlbums();
+        System.out.println(String.format("Found %d albums", photosets.size()));
+
+        long startedAt = System.currentTimeMillis();
+        int currentAlbum = 1;
+        AtomicInteger processedPhotos = new AtomicInteger(0);
+        AtomicInteger downloadedPhotos = new AtomicInteger(0);
+        for (Map.Entry<String, Photoset> entry : photosets.entrySet()) {
+            String setName = entry.getKey();
+            Photoset photoset = entry.getValue();
+            Map<String, Photo> photosForSet = getPhotosForSet(photoset.getId());
+
+            System.out.print(String.format("\n(%s) %d photos processed so far. Now processing album [%d of %d] %s with %d photos ",
+                    periodFormatter.print(new Duration(System.currentTimeMillis() - startedAt).toPeriod()),
+                    processedPhotos.get(),
+                    currentAlbum++,
+                    photosets.size(),
+                    setName,
+                    photosForSet.size()));
+
+            Path setFolder = target.resolve(setName);
+            setFolder.toFile().mkdirs();
+
+            photosForSet.values().stream()
+                    .forEach(e -> threadPoolExecutor.submit(() -> {
+                        processedPhotos.incrementAndGet();
+                        if (this.downloadPhoto(setFolder, e)) {
+                            downloadedPhotos.getAndIncrement();
+                            System.out.print("+");
+                        } else {
+                            System.out.print("-");
+                        }
+                    }));
+        }
+        threadPoolExecutor.shutdown();
+        while (!threadPoolExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
+            System.out.println("Awaiting completion of threads.");
+        }
+        System.out.println(String.format("Downloaded a total of %d photos. %d processed. Duration: ",
+                downloadedPhotos.get(),
+                processedPhotos.get(),
+                periodFormatter.print(new Duration(System.currentTimeMillis() - startedAt).toPeriod())));
+    }
+
+    private boolean downloadPhoto(Path setFolder, Photo photo) {
+        File file = setFolder.resolve("_flicked_" + photo.getId() + ".jpg").toFile();
+        if (file.exists()) {
+            return false;
+        }
+
+        try {
+            URL url = new URL(photo.getOriginalUrl());
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.connect();
+            try (InputStream is = new BufferedInputStream(conn.getInputStream());
+                 OutputStream os = new BufferedOutputStream(new FileOutputStream(file))) {
+                String formattedDateTaken = new SimpleDateFormat("dd/MM/yyyy HH:mm:ss").format(photo.getDateTaken() == null ? new Date() : photo.getDateTaken());
+                TiffOutputSet outputSet = new TiffOutputSet();
+                TiffOutputDirectory rootDirectory = outputSet.getOrCreateRootDirectory();
+                rootDirectory.add(TiffTagConstants.TIFF_TAG_DATE_TIME,
+                        formattedDateTaken);
+                TiffOutputDirectory tiffDirectory = outputSet.getOrCreateExifDirectory();
+                tiffDirectory.add(ExifTagConstants.EXIF_TAG_DATE_TIME_ORIGINAL,
+                        formattedDateTaken);
+                tiffDirectory.add(ExifTagConstants.EXIF_TAG_SUB_SEC_TIME_ORIGINAL,
+                        "00");
+                tiffDirectory.add(ExifTagConstants.EXIF_TAG_DATE_TIME_DIGITIZED,
+                        formattedDateTaken);
+                tiffDirectory.add(ExifTagConstants.EXIF_TAG_SUB_SEC_TIME_DIGITIZED,
+                        "00");
+                new ExifRewriter().updateExifMetadataLossy(is, os, outputSet);
+                return true;
+            }
+        } catch (Exception e) {
+            System.out.println(String.format("\nUnable to download %s", photo.getId()));
+            e.printStackTrace();
+        }
+        return false;
+    }
+
+    public static void main(String... args) throws Exception {
+        if (args.length != 2) {
+            throw new IllegalArgumentException("Inform option and path Eg: java Main --upload C:\\temp");
+        }
+
+        Main main = new Main();
+
+        if ("--download".equals(args[0])) {
+            main.download(Paths.get(args[1]));
+        } else if ("--upload".equals(args[0])) {
+            main.upload(Paths.get(args[1]));
+        } else {
+            throw new IllegalArgumentException("First argument must be either --download or --upload");
+        }
+    }
+
+    private boolean isOnFlickr(Path path) {
+        if (path.getFileName().toString().matches("[_flicked_.*]")) {
+            return true;
+        }
+        if (path.getFileName().toString().matches("\\d{8}_\\d{1,9}\\.jpg")) {
+            return true;
+        }
+        return false;
+    }
+
     private Map<String, List<Path>> findAlbumsToUpload(Path path) throws IOException {
-        return Files.find(path, 2, (p, a) -> p.toString().endsWith("jpg") && !p.getFileName().toString().startsWith("_flicked_"))
+        return Files.find(path, 5, (p, a) -> p.toString().endsWith("jpg") && !isOnFlickr(p))
                 .collect(Collectors.groupingBy(p -> p.getParent().getFileName().toString()));
     }
 
