@@ -396,7 +396,7 @@ public class Main {
         } catch (FlickrException e) {
             throw new IllegalStateException(String.format("Unable to upload picture %s", path), e);
         }
-        file.renameTo(path.getParent().resolve("_flicked_" + path.getFileName()).toFile());
+        file.renameTo(path.getParent().resolve("_flicked_" + System.currentTimeMillis() + path.getFileName()).toFile());
         return photoId;
     }
 
