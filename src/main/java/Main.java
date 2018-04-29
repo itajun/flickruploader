@@ -55,7 +55,7 @@ public class Main {
 
     private ThreadPoolExecutor threadPoolExecutor = new ThreadPoolExecutor(2,
                 Runtime.getRuntime().availableProcessors(),
-                0,
+                100,
                 TimeUnit.MILLISECONDS,
                 new ArrayBlockingQueue(Runtime.getRuntime().availableProcessors(), true),
                 new ThreadPoolExecutor.CallerRunsPolicy());
@@ -105,13 +105,10 @@ public class Main {
         albums.values().stream()
                 .flatMap(e -> e.stream())
                 .forEach(e -> {
-                    System.out.print(String.format("  Uploading picture %s", e));
-                    threadPoolExecutor.submit(() -> pathIdMap.put(e, uploadFile(e)));
+                    System.out.print("Uploading " + e);
+                    pathIdMap.put(e, uploadFile(e));
+                    System.out.println(" done.");
                 });
-        threadPoolExecutor.shutdown();
-        while (!threadPoolExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
-            System.out.println("Awaiting completion of threads.");
-        }
 
         System.out.println(String.format("Uploaded %d pictures", pathIdMap.size()));
 
@@ -269,7 +266,7 @@ public class Main {
     }
 
     private boolean isOnFlickr(Path path) {
-        if (path.getFileName().toString().matches("[_flicked_.*]")) {
+        if (path.getFileName().toString().startsWith("_flicked_")) {
             return true;
         }
         if (path.getFileName().toString().matches("\\d{8}_\\d{1,9}\\.jpg")) {

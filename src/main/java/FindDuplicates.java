@@ -41,7 +41,7 @@ public class FindDuplicates {
 
     private ThreadPoolExecutor threadPoolExecutor = new ThreadPoolExecutor(2,
             Runtime.getRuntime().availableProcessors(),
-            0,
+            100,
             TimeUnit.MILLISECONDS,
             new ArrayBlockingQueue(100000, true),
             new ThreadPoolExecutor.CallerRunsPolicy());
